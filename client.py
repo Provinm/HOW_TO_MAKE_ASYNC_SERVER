@@ -8,11 +8,13 @@ async def client(message: str):
     writer.write(message.encode())
     await writer.drain()
 
-    data = await reader.read(1000)
+    data = await reader.read(10000)
     print(f'Received: {data.decode()!r}')
 
     print('Close the connection')
     writer.close()
     await writer.wait_closed()
 
-asyncio.run(client('ping'))
+
+msg = 'ping'
+asyncio.run(client(msg))

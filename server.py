@@ -36,6 +36,19 @@ logger = logging.getLogger()
 #     logger.info(f"Connection close")
 #     writer.close()
 
+
+class Request:
+
+    def __init__(self, method: str, router: str, headers: dict = {}):
+
+        self.method = method
+        self.router = router
+        self.headers = headers
+
+    def __str__(self) -> str:
+        
+        return f"method = {self.method}, router = {self.router}, headers = {self.headers}"
+
 # server
 class Server:
 
@@ -55,13 +68,30 @@ class Server:
         logger.info(f"\n{msg}")
         logger.info(f"end -----------------------------")
 
-        res = await self.app(msg)
+        req = self.parse_http_request(msg)
+        logger.info(f"parsed request = {req}")
+        res = await self.app(req)
         writer.write(res.encode())
         await writer.drain()
         logger.info(f"Send: {res}")
         logger.info(f"Connection close")
         writer.close()
 
+    def parse_http_request(self, msg: str):
+
+        lines = msg.split("\n")
+        head = lines[0]
+        method, uri, _ = head.split(" ")
+        headers = {}
+        for line in lines[1:]:
+            if not line:
+                continue
+            if ": " not in line:
+                continue
+            key, value = line.split(": ")
+            headers[key] = value
+
+        return Request(method, uri, headers)
 
     async def serve(self):
 
@@ -71,12 +101,27 @@ class Server:
 
 
 # application
-async def app(msg) -> str:
+async def app(req: Request) -> str:
 
-    if msg == "ping":
-        return "pong"
 
-    return "cannot handle"
+    if req.router == "/":
+        return "root router"
+
+    elif req.router == "/abc":
+        return "handling abc"
+    elif req.router == "/ping":
+        msg = (
+            "HTTP/1.1 200 OK\r\n"
+            "date: Wed, 18 Aug 2021 15:17:41 GMT\r\n"
+            "server: uvicorn\r\n"
+            "content-length: 14\r\n"
+            "\r\n"
+            "hello, world"
+            "\r\n"
+        )
+        return msg
+    else:
+        return "handleing others"
 
 
 if __name__ == "__main__":
