@@ -1,6 +1,7 @@
 import typing
 import asyncio
 import logging
+import json
 import h11
 from urllib.parse import unquote
 
@@ -91,6 +92,8 @@ class H11Protocol(asyncio.BaseProtocol):
                 )
 
                 self.loop.create_task(self.cycle(app))
+            elif _type is h11.Data:
+                self.cycle.body += event.data
 
             elif _type is h11.EndOfMessage:
                 self.cycle.message_event.set()
@@ -113,6 +116,8 @@ class Cycle:
         self.message_event = message_event
         self.on_response = on_response
         self.response_complete = False
+        self.body = b""
+        self.disconnected = False
 
     async def __call__(self, app) -> typing.Any:
         await app(self.scope, self.receive, self.send)
@@ -124,10 +129,16 @@ class Cycle:
             event = h11.Data(data=body)
             output = self.conn.send(event)
             self.transport.write(output)
-            self.response_complete = True
             event = h11.EndOfMessage()
+
+            # trick
+            # trick
+            if self.conn._writer and hasattr(self.conn._writer, "_length"):
+                setattr(self.conn._writer, "_length", 0)
+
             output = self.conn.send(event)
             self.transport.write(output)
+            self.response_complete = True
 
         elif message_type == "http.response.start":
             status_code = message["status"]
@@ -147,23 +158,17 @@ class Cycle:
 
     async def receive(self):
 
-        # if not self.response_complete:
-        #     await self.message_event.wait()
-        #     self.message_event.clear()
+        if self.disconnected:
+            message = {"type": "http.disconnect"}
+        else:
+            message = {
+                "type": "http.request",
+                "body": self.body,
+            }
+            self.body = b""
+            self.disconnected = True
 
-        # if self.response_complete:
-        #     message = {"type": "http.disconnect"}
-
-        # else:
-        #     message = {
-        #         "type": "http.request",
-        #         "body": self.body,
-        #         "more_body": self.more_body,
-        #     }
-        #     self.body = b""
-
-        # return message
-        pass
+        return message
 
 
 # server
@@ -204,8 +209,14 @@ class Server:
 
 
 class Request:
-    def __init__(self, scope: dict) -> None:
+    def __init__(self, scope: dict, receive: typing.Callable) -> None:
         self.scope = scope
+        self.receive = receive
+        self._body_bytes = b""
+
+    @property
+    def path(self):
+        return self.scope["path"]
 
     @property
     def method(self):
@@ -229,6 +240,23 @@ class Request:
     def headers(self):
         return {key.decode(): value.decode() for key, value in self.scope["headers"]}
 
+    async def json(self):
+        if hasattr(self, "_body"):
+            return getattr(self, "_body")
+
+        while True:
+            event = await self.receive()
+            if event["type"] == "http.disconnect":
+                if self._body_bytes:
+                    self._body = json.loads(self._body_bytes.decode())
+                else:
+                    self._body = {}
+                break
+            else:
+                self._body_bytes += event["body"]
+
+        return getattr(self, "_body", {})
+
 
 class Response:
     def __init__(self, content: str, status_code: int) -> None:
@@ -251,17 +279,8 @@ class Route:
         send: typing.Callable,
     ) -> None:
 
-        request = Request(scope)
-        res: Response = await self.endpoint(request)
-        logger.info(f"res = {res}")
-        await send(
-            {
-                "type": "http.response.start",
-                "status": res.status_code,
-            }
-        )
-
-        await send({"type": "http.response.body", "body": res.body})
+        request = Request(scope, receive)
+        return await self.endpoint(request)
 
     def match(self, url: str) -> bool:
         return url == self.path
@@ -289,9 +308,60 @@ class Router:
         raise self.NotFound()
 
 
+class BaseMiddleWare:
+    def __init__(self, other: typing.Callable = None) -> None:
+
+        self.other = other
+
+    async def __call__(
+        self, scope: dict, receive: typing.Callable, send: typing.Callable
+    ) -> typing.Any:
+
+        request = Request(scope, receive)
+        req_res = await self.process_request(request)
+
+        if type(req_res) is Response:
+            return req_res
+
+        if self.other:
+            res = await self.other(scope, receive, send)
+
+        res_res = await self.process_response(res)
+        return res_res
+
+    async def process_request(self, r: Request) -> typing.Any:
+        pass
+
+    async def process_response(self, r: Response) -> Response:
+        return r
+
+
 class Application:
-    def __init__(self, router: Router) -> None:
+    def __init__(
+        self,
+        router: Router,
+        middlewares: typing.List[typing.Type[BaseMiddleWare]] = None,
+    ) -> None:
         self.router = router
+        if not middlewares:
+            middlewares = []
+
+        middlewares = middlewares[::-1]
+
+        last_process: typing.Callable = None  # type: ignore
+
+        for process in middlewares:
+            if not last_process:
+                last_process = process(router)
+
+            else:
+                new_process = process(last_process)
+                last_process = new_process
+
+        if not last_process:
+            last_process = router
+
+        self.app = last_process
 
     async def __call__(
         self,
@@ -300,7 +370,27 @@ class Application:
         send: typing.Callable,
     ) -> None:
 
-        return await self.router(scope, receive, send)
+        res: Response = await self.app(scope, receive, send)
+        await send(
+            {
+                "type": "http.response.start",
+                "status": res.status_code,
+            }
+        )
+
+        await send({"type": "http.response.body", "body": res.body})
+
+
+class ReqMiddleware(BaseMiddleWare):
+    async def process_request(self, r: Request) -> typing.Any:
+        if r.path == "/block":
+            return Response("block", 200)
+
+
+class ResMiddleware(BaseMiddleWare):
+    async def process_response(self, r: Response) -> typing.Any:
+        logger.info(f"cur res = {r}")
+        return r
 
 
 # business
@@ -310,8 +400,21 @@ async def hello(request: Request) -> Response:
     return Response(f"hello, {name}", 200)
 
 
-router = Router([Route("/", hello)])
-app = Application(router)
+async def hello_someone(request: Request) -> Response:
+
+    body = await request.json()
+    name = body.get("name")
+    logger.info(f"body = {body}")
+    return Response(f"hello, {name}", 200)
+
+
+router = Router(
+    [
+        Route("/", hello),
+        Route("/hello", hello_someone),
+    ]
+)
+app = Application(router, [ReqMiddleware, ResMiddleware])
 
 
 if __name__ == "__main__":
